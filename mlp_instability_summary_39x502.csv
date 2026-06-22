@@ -1,0 +1,10 @@
+"metric","value"
+"Real mean RMSE",0.285437041015157
+"Real SD RMSE",0.0191490348580407
+"Real mean R2",0.59543746615678
+"Real SD R2",0.0561371232350828
+"Real max R2",0.700587166494483
+"Median Jaccard top20",0.176470588235294
+"Mean Jaccard top20",0.1749077548044
+"P(null max R2 >= real max R2)",0
+"P(null top importance >= real top importance)",0.15
