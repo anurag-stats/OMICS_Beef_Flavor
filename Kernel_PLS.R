@@ -1,0 +1,384 @@
+#' ---
+#' title: "Kernel PLS"
+#' author: "Anurag Banerjee"
+#' date: "2026-04-17"
+#' output: pdf_document
+#' ---
+#' 
+## ----setup, include=FALSE---------------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+
+#' 
+#' 
+#' 
+#' Kernel PLS is used for non-linear interactions between the predictors.
+#' 
+## ----warning=FALSE, message=FALSE-------------------------------------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(pls)
+library(kernlab)
+library(ggplot2)
+library(readxl)
+
+#' 
+#' 
+## ----message=FALSE, warning=FALSE-------------------------------------------------------------------------------
+df <- read_excel("Feature List.xlsx")
+outcome_col <- "Liking"
+chem_cols <- colnames(df)[4:505]
+group <- "group"
+dat <- df[, c(group, outcome_col, chem_cols)]
+dat <- na.omit(dat)
+dat[, chem_cols] <- log(dat[, chem_cols])
+names(dat)[3:504] <- paste0("chemical_", 1:502)
+chem_cols <- colnames(dat)[3:504]
+
+# Safety checks
+stopifnot(nrow(dat) >= 8)
+stopifnot(length(chem_cols) >= 5)
+
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+sample_col <- "group"
+y_col <- "Liking"
+beef_df <- dat
+chem_cols <- setdiff(names(beef_df), c(sample_col, y_col))
+
+#' 
+#' Aggregate to sample level:
+## ---------------------------------------------------------------------------------------------------------------
+beef_sample <- beef_df %>%
+  group_by(.data[[sample_col]]) %>%
+  summarise(
+    Liking = mean(.data[[y_col]], na.rm = TRUE),
+    n_rep       = sum(!is.na(.data[[y_col]])),
+    across(all_of(chem_cols), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Remove zero-variance chemical columns
+chem_mat <- beef_sample %>% select(all_of(chem_cols))
+keep <- sapply(chem_mat, function(x) sd(x, na.rm = TRUE) > 0)
+chem_mat <- chem_mat[, keep, drop = FALSE]
+
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+X <- scale(as.matrix(chem_mat))
+y <- beef_sample[[y_col]]
+sample_ids <- dat[[sample_col]]
+
+cat("Number of samples:", nrow(X), "\n")
+cat("Number of chemicals retained:", ncol(X), "\n")
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+#Utility functions
+q2_score <- function(y_true, y_pred) {
+  1 - sum((y_true - y_pred)^2) / sum((y_true - mean(y_true))^2)
+}
+
+rmse <- function(y_true, y_pred) {
+  sqrt(mean((y_true - y_pred)^2))
+}
+
+#' 
+#' 
+#' Leave One Out Cross Validation for linear PLS:
+## ---------------------------------------------------------------------------------------------------------------
+loocv_pls <- function(X, y, ncomp_grid = 1:min(5, nrow(X) - 1)) {
+  n <- nrow(X)
+  results <- data.frame(ncomp = ncomp_grid, Q2 = NA, RMSE = NA)
+
+  for (j in seq_along(ncomp_grid)) {
+    k <- ncomp_grid[j]
+    pred <- rep(NA_real_, n)
+
+    for (i in 1:n) {
+      train_idx <- setdiff(1:n, i)
+      test_idx  <- i
+
+      fit <- plsr(y ~ X,
+                  ncomp = k,
+                  subset = train_idx,
+                  validation = "none",
+                  method = "simpls")
+
+      pred[i] <- as.numeric(predict(fit, newdata = data.frame(X = I(X[test_idx, , drop = FALSE])),
+                                    ncomp = k))
+    }
+
+    results$Q2[j]   <- q2_score(y, pred)
+    results$RMSE[j] <- rmse(y, pred)
+  }
+
+  best_idx <- which.max(results$Q2)
+  list(
+    table = results,
+    best_ncomp = results$ncomp[best_idx],
+    best_Q2 = results$Q2[best_idx],
+    best_RMSE = results$RMSE[best_idx]
+  )
+}
+
+#' 
+#' 
+#' Leave One out Cross Validation for Non-linear kernel
+## ---------------------------------------------------------------------------------------------------------------
+loocv_rbf <- function(X, y, sigma_grid, var_grid, kernel) {
+  n <- nrow(X)
+  out <- expand.grid(sigma = sigma_grid, var = var_grid)
+  out$Q2 <- NA_real_
+  out$RMSE <- NA_real_
+
+  for (j in 1:nrow(out)) {
+    pred <- rep(NA_real_, n)
+
+    for (i in 1:n) {
+      train_idx <- setdiff(1:n, i)
+      test_idx  <- i
+
+      fit <- gausspr(
+        x = X[train_idx, , drop = FALSE],
+        y = y[train_idx],
+        kernel = kernel,
+        kpar = list(sigma = out$sigma[j]),
+        var = out$var[j]
+      )
+
+      pred[i] <- as.numeric(predict(fit, X[test_idx, , drop = FALSE]))
+    }
+
+    out$Q2[j]   <- q2_score(y, pred)
+    out$RMSE[j] <- rmse(y, pred)
+  }
+
+  best_idx <- which.max(out$Q2)
+  list(
+    table = out,
+    best_sigma = out$sigma[best_idx],
+    best_var   = out$var[best_idx],
+    best_Q2    = out$Q2[best_idx],
+    best_RMSE  = out$RMSE[best_idx]
+  )
+}
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+#Fitting baseline linear PLS
+pls_res <- loocv_pls(X, y, ncomp_grid = 1:min(4, nrow(X) - 1))
+pls_res$table
+pls_res$best_ncomp
+pls_res$best_Q2
+pls_res$best_RMSE
+
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+#Fitting non-linear RBF kernel (Gaussian Process)
+sigma_grid <- c(0.001, 0.01, 0.1, 1)
+var_grid   <- c(0.001, 0.01, 0.1)
+
+rbf_res <- loocv_rbf(X, y, sigma_grid = sigma_grid, var_grid = var_grid, kernel = "rbf")
+rbf_res$table
+rbf_res$best_sigma
+rbf_res$best_var
+rbf_res$best_Q2
+rbf_res$best_RMSE
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+
+# 8. Permutation test
+perm_test_model <- function(X, y, B = 500, seed = 123) {
+  set.seed(seed)
+
+  # Observed
+  obs_pls <- loocv_pls(X, y, ncomp_grid = 1:min(4, nrow(X) - 1))
+  obs_rbf <- loocv_rbf(X, y,
+                       sigma_grid = c(0.001, 0.01, 0.1, 1),
+                       var_grid   = c(0.001, 0.01, 0.1),
+                       kernel = "rbf")
+
+  perm_pls_q2 <- numeric(B)
+  perm_rbf_q2 <- numeric(B)
+
+  for (b in 1:B) {
+    y_perm <- sample(y, replace = FALSE)
+
+    perm_pls_q2[b] <- loocv_pls(X, y_perm,
+                                ncomp_grid = 1:min(4, nrow(X) - 1))$best_Q2
+
+    perm_rbf_q2[b] <- loocv_rbf(X, y_perm,
+                                sigma_grid = c(0.001, 0.01, 0.1, 1),
+                                var_grid   = c(0.001, 0.01, 0.1), kernel = "rbf")$best_Q2
+  }
+
+  p_pls <- (1 + sum(perm_pls_q2 >= obs_pls$best_Q2)) / (B + 1)
+  p_rbf <- (1 + sum(perm_rbf_q2 >= obs_rbf$best_Q2)) / (B + 1)
+
+  list(
+    observed = list(
+      pls_Q2 = obs_pls$best_Q2,
+      pls_ncomp = obs_pls$best_ncomp,
+      rbf_Q2 = obs_rbf$best_Q2,
+      rbf_sigma = obs_rbf$best_sigma,
+      rbf_var = obs_rbf$best_var
+    ),
+    null = list(
+      pls_Q2 = perm_pls_q2,
+      rbf_Q2 = perm_rbf_q2
+    ),
+    pvalues = list(
+      pls = p_pls,
+      rbf = p_rbf
+    )
+  )
+}
+
+perm_res <- perm_test_model(X, y, B = 500, seed = 2026)
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+perm_res$observed
+
+
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+perm_res$pvalues
+
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+plot_df <- bind_rows(
+  data.frame(model = "Linear PLS", Q2 = perm_res$null$pls_Q2),
+  data.frame(model = "RBF kernel model", Q2 = perm_res$null$rbf_Q2)
+)
+
+obs_df <- data.frame(
+  model = c("Linear PLS", "RBF kernel model"),
+  Q2 = c(perm_res$observed$pls_Q2, perm_res$observed$rbf_Q2)
+)
+
+ggplot(plot_df, aes(x = Q2)) +
+  geom_histogram(bins = 30, fill = "grey75", color = "white") +
+  geom_vline(data = obs_df, aes(xintercept = Q2), color = "red", linewidth = 1) +
+  facet_wrap(~ model, scales = "free") +
+  theme_minimal() +
+  labs(
+    title = "Permutation test for sample-level liking prediction",
+    subtitle = "Red line = observed LOOCV Q2",
+    x = "Permuted LOOCV Q2",
+    y = "Count"
+  )
+
+#' 
+#' 
+#' 
+#' Top 20:
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+top_pls <- extract_top_pls(
+  X = X,
+  y = y,
+  var_names = colnames(chem_mat),
+  ncomp = pls_res$best_ncomp,
+  top_n = 20,
+  ranking = "weights"
+)
+
+top_pls$top_table
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+top_pls_coef <- extract_top_pls(
+  X = X,
+  y = y,
+  var_names = colnames(chem_mat),
+  ncomp = pls_res$best_ncomp,
+  top_n = 20,
+  ranking = "coefficients"
+)
+
+top_pls_coef$top_table
+
+#' 
+#' For Gaussian (Non-linear) Kernel:
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+extract_top_kernel <- function(X, y, var_names = colnames(X),
+                               sigma, var,
+                               top_n = 20,
+                               n_perm = 30,
+                               seed = 123) {
+  X <- as.matrix(X)
+  stopifnot(nrow(X) == length(y))
+
+  if (is.null(var_names)) {
+    var_names <- paste0("V", seq_len(ncol(X)))
+  }
+
+  set.seed(seed)
+
+  fit <- gausspr(
+    x = X,
+    y = y,
+    kernel = "rbfdot",
+    kpar = list(sigma = sigma),
+    var = var
+  )
+
+  baseline_pred <- as.numeric(predict(fit, X))
+  baseline_rmse <- sqrt(mean((y - baseline_pred)^2))
+
+  importance_mat <- matrix(NA_real_, nrow = ncol(X), ncol = n_perm)
+
+  for (j in seq_len(ncol(X))) {
+    for (b in seq_len(n_perm)) {
+      X_perm <- X
+      X_perm[, j] <- sample(X_perm[, j], replace = FALSE)
+      pred_perm <- as.numeric(predict(fit, X_perm))
+      rmse_perm <- sqrt(mean((y - pred_perm)^2))
+      importance_mat[j, b] <- rmse_perm - baseline_rmse
+    }
+  }
+
+  out <- data.frame(
+    variable = var_names,
+    importance = rowMeans(importance_mat),
+    importance_sd = apply(importance_mat, 1, sd)
+  ) %>%
+    arrange(desc(importance)) %>%
+    slice(seq_len(min(top_n, n())))
+
+  list(
+    fit = fit,
+    top_table = out,
+    raw_importance = importance_mat
+  )
+}
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------
+#Top 20 for Gaussian Kernel PLS
+top_kernel <- extract_top_kernel(
+  X = X,
+  y = y,
+  var_names = colnames(chem_mat),
+  sigma = rbf_res$best_sigma,
+  var = rbf_res$best_var,
+  top_n = 20,
+  n_perm = 50,
+  seed = 2026
+)
+
+top_kernel$top_table
+
